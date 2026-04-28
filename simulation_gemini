@@ -1,0 +1,193 @@
+# ============================================================
+# 验证样本PVE高估总体PVE的模拟实验
+# 最终版：结合稳健的模拟逻辑与高质量的可视化
+# ============================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+set.seed(42)
+
+# ------------------------------------------------------------
+# 核心函数 (已优化数值稳定性和定义精确度)
+# ------------------------------------------------------------
+
+# 生成低秩均值矩阵 M (对齐论文符号)
+make_mean_matrix <- function(n, p, rank = 2, signal = 5) {
+  # 使用 SVD 构建随机正交基，更稳健
+  U <- matrix(rnorm(n * rank), n, rank)
+  V <- matrix(rnorm(p * rank), p, rank)
+  u_ortho <- qr.Q(qr(U))
+  v_ortho <- qr.Q(qr(V))
+  
+  sv <- signal * seq(1, 0.5, length.out = rank)
+  M <- u_ortho %*% diag(sv, rank, rank) %*% t(v_ortho)
+  return(M)
+}
+
+
+# 单次模拟：返回各PC的 sample_pve 和 population_pve
+one_sim <- function(n, p, sigma, rank = 2, signal = 5) {
+  M     <- make_mean_matrix(n, p, rank, signal)
+  E     <- matrix(rnorm(n * p, sd = sigma), n, p)
+  X     <- M + E
+  
+  svd_x <- svd(X)
+  vals  <- svd_x$d^2
+  p_eff <- min(n, p) # 有效的主成分数量
+
+  # 1. 样本PVE
+  spve  <- vals / sum(vals)
+  
+  # 2. 总体PVE (以观测向量为基)
+  ppve  <- sapply(1:p_eff, function(k) {
+    uk <- svd_x$u[, k, drop = FALSE]
+    vk <- svd_x$v[, k, drop = FALSE]
+    theta_k_sq <- as.numeric(t(uk) %*% M %*% vk)^2
+    # 使用总观测方差作为分母，以进行公平比较
+    return(theta_k_sq / sum(vals)) 
+  })
+  
+  # 计算比率
+  ratio <- spve / (ppve + 1e-12) # 加一个极小值防止除以零
+  
+  data.frame(
+    k       = 1:p_eff,
+    spve    = spve,
+    ppve    = ppve,
+    ratio   = ratio
+  )
+}
+
+# 重复模拟取中位数
+run_sim <- function(n, p, sigma, nrep = 1000, rank = 2, signal = 5, label = "") {
+  res <- replicate(nrep, one_sim(n, p, sigma, rank, signal), simplify = FALSE)
+  res <- bind_rows(res)
+  res %>%
+    group_by(k) %>%
+    summarise(
+      med_spve  = median(spve,  na.rm = TRUE),
+      med_ppve  = median(ppve,  na.rm = TRUE),
+      med_ratio = median(ratio, na.rm = TRUE),
+      .groups   = "drop"
+    ) %>%
+    mutate(
+      log_ratio = log(med_ratio), # 现在可以安全地取对数
+      label = label, n = n, p = p, sigma = sigma
+    )
+}
+
+
+# ============================================================
+# 实验执行 (与您原始代码一致)
+# ============================================================
+nrep <- 500
+
+configs1 <- list(
+  list(n=31, p=3, sigma=0.1, label="σ=0.1"),
+  list(n=31, p=3, sigma=0.2, label="σ=0.2"),
+  list(n=31, p=3, sigma=0.3, label="σ=0.3")
+)
+
+results1 <- bind_rows(lapply(configs1, function(cfg) {
+  cat("Running: n=", cfg$n, "p=", cfg$p, "sigma=", cfg$sigma, "\n")
+  run_sim(cfg$n, cfg$p, cfg$sigma, nrep=nrep, label=cfg$label)
+}))
+
+configs2 <- list(
+  list(n=31, p=3,  sigma=0.1, label="p=3"),
+  list(n=31, p=10, sigma=0.1, label="p=10"),
+  list(n=31, p=20, sigma=0.1, label="p=20")
+)
+
+results2 <- bind_rows(lapply(configs2, function(cfg) {
+  cat("Running: n=", cfg$n, "p=", cfg$p, "sigma=", cfg$sigma, "\n")
+  run_sim(cfg$n, cfg$p, cfg$sigma, nrep=nrep, label=cfg$label)
+}))
+
+# ============================================================
+# 绘图 (完全采用您设计的、更优秀的可视化方案)
+# ============================================================
+
+# --- 实验1：log(样本PVE / 总体PVE) 随 sigma 变化 ---
+p1 <- ggplot(results1, aes(x = factor(k), y = log_ratio,
+                           color = label, group = label)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  scale_color_manual(values = c("σ=0.1"="#2196F3",
+                                "σ=0.2"="#FF9800",
+                                "σ=0.3"="#F44336")) +
+  labs(
+    title    = "实验(1)：信噪比对高估程度的影响",
+    subtitle = "n=31, p=3；log(样本PVE / 总体PVE) > 0 说明存在高估",
+    x        = "主成分索引 k",
+    y        = "log(高估倍数) 中位数",
+    color    = "噪声水平"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+# --- 实验1补充：直接对比样本 vs 总体PVE ---
+p1b <- results1 %>%
+  select(k, med_spve, med_ppve, label) %>%
+  pivot_longer(c(med_spve, med_ppve),
+               names_to  = "type",
+               values_to = "pve") %>%
+  mutate(type = recode(type,
+                       med_spve = "样本PVE (有偏)",
+                       med_ppve = "总体PVE (真值)")) %>%
+  ggplot(aes(x = factor(k), y = pve,
+             color = label, linetype = type, group = interaction(label, type))) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  scale_linetype_manual(values = c("样本PVE (有偏)" = "solid", "总体PVE (真值)" = "dashed")) +
+  scale_color_manual(values = c("σ=0.1"="#2196F3",
+                                "σ=0.2"="#FF9800",
+                                "σ=0.3"="#F44336")) +
+  labs(
+    title    = "实验(1)补充：样本PVE与总体PVE的直观对比",
+    x        = "主成分索引 k",
+    y        = "PVE 中位数",
+    color    = "噪声水平",
+    linetype = "PVE类型"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+# --- 实验2：log(样本PVE / 总体PVE) 随 p 变化 ---
+p2 <- ggplot(results2, aes(x = factor(k), y = log_ratio,
+                 color = label, group = label)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  scale_color_manual(values = c("p=3"="#4CAF50",
+                                "p=10"="#FF9800",
+                                "p=20"="#9C27B0")) +
+  labs(
+    title    = "实验(2)：维度p对高估程度的影响",
+    subtitle = "n=31, σ=0.1；维度越高，噪声污染越严重，高估加剧",
+    x        = "主成分索引 k",
+    y        = "log(高估倍数) 中位数",
+    color    = "维度 p"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+# --- 打印图形 ---
+print(p1)
+print(p1b)
+print(p2)
+
+# ============================================================
+# 数值摘要 (与您原始代码一致)
+# ============================================================
+cat("\n========== 实验(1) 数值摘要 ==========\n")
+print(results1 %>% select(label, k, med_spve, med_ppve, log_ratio) %>%
+        arrange(label, k), digits = 4)
+
+cat("\n========== 实验(2) 数值摘要 ==========\n")
+print(results2 %>%
+        select(label, k, med_spve, med_ppve, log_ratio) %>%
+        arrange(label, k), digits = 4)
