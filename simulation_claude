@@ -1,0 +1,226 @@
+# ============================================================
+# 验证样本PVE高估总体PVE的模拟实验
+# 严格遵循 Perry et al. (2025) 公式(2.3)和(2.5)
+# ============================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+set.seed(42)
+
+# ------------------------------------------------------------
+# 生成低秩均值矩阵（固定秩为2，信号强度固定）
+# ------------------------------------------------------------
+make_mean_matrix <- function(n, p, rank = 2, signal = 5) {
+  UV  <- matrix(rnorm(n * p), n, p)
+  duv <- svd(UV)
+  U   <- duv$u[, 1:rank, drop = FALSE]
+  V   <- duv$v[, 1:rank, drop = FALSE]
+  sv  <- signal * seq(1, 0.5, length.out = rank)
+  Theta <- U %*% diag(sv, rank, rank) %*% t(V)
+  return(Theta)
+}
+
+# ------------------------------------------------------------
+# 严格按Perry论文计算样本PVE（公式2.3）和总体PVE（公式2.5）
+# 样本PVE_k  = s_k^2 / sum(s_k'^2)
+# 总体PVE_k  = theta_k^2 / (sum(s_k'^2) - s_k^2 + theta_k^2)
+# 其中 theta_k = u_k(X)^T Theta v_k(X)
+# ------------------------------------------------------------
+compute_pve_pair <- function(X, Theta) {
+  dX    <- svd(X)
+  vals  <- dX$d^2          # 样本奇异值平方：s_k^2{X}
+  p     <- length(vals)
+  s_sum <- sum(vals)       # sum_k s_k^2{X}
+  
+  sample_pve <- vals / s_sum   # 公式(2.3)
+  
+  pop_pve <- sapply(1:p, function(k) {
+    uk    <- dX$u[, k]
+    vk    <- dX$v[, k]
+    theta <- as.numeric(t(uk) %*% Theta %*% vk)   # u_k^T Theta v_k
+    denom <- s_sum - vals[k] + theta^2              # 公式(2.5)分母
+    if (denom < 1e-12) return(0)
+    theta^2 / denom
+  })
+  
+  data.frame(
+    k          = 1:p,
+    sample_pve = sample_pve,
+    pop_pve    = pop_pve,
+    ratio      = ifelse(pop_pve > 1e-10, sample_pve / pop_pve, NA_real_)
+  )
+}
+
+# ------------------------------------------------------------
+# 单次模拟
+# ------------------------------------------------------------
+one_sim <- function(n, p, sigma, rank = 2, signal = 5) {
+  Theta <- make_mean_matrix(n, p, rank, signal)
+  E     <- matrix(rnorm(n * p, sd = sigma), n, p)
+  X     <- Theta + E
+  compute_pve_pair(X, Theta)
+}
+
+# ------------------------------------------------------------
+# 重复模拟，取各统计量的中位数
+# ------------------------------------------------------------
+run_sim <- function(n, p, sigma, nrep = 1000, rank = 2, signal = 5, label = "") {
+  res <- replicate(nrep, one_sim(n, p, sigma, rank, signal), simplify = FALSE)
+  bind_rows(res) %>%
+    group_by(k) %>%
+    summarise(
+      med_sample_pve = median(sample_pve, na.rm = TRUE),
+      med_pop_pve    = median(pop_pve,    na.rm = TRUE),
+      med_log_ratio  = median(log(ratio), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(label = label, n = n, p = p, sigma = sigma)
+}
+
+# ============================================================
+# 实验(1)：固定 n=31, p=3，变化 sigma
+# ============================================================
+cat("=== 运行实验(1) ===\n")
+configs1 <- list(
+  list(n=31, p=3, sigma=0.1, label="σ=0.1"),
+  list(n=31, p=3, sigma=0.2, label="σ=0.2"),
+  list(n=31, p=3, sigma=0.3, label="σ=0.3")
+)
+
+results1 <- bind_rows(lapply(configs1, function(cfg) {
+  cat(sprintf("  n=%d, p=%d, sigma=%.1f\n", cfg$n, cfg$p, cfg$sigma))
+  run_sim(cfg$n, cfg$p, cfg$sigma, label = cfg$label)
+}))
+
+# ============================================================
+# 实验(2)：固定 n=31, sigma=0.1，变化 p
+# ============================================================
+cat("=== 运行实验(2) ===\n")
+configs2 <- list(
+  list(n=31, p=3,  sigma=0.1, label="p=3"),
+  list(n=31, p=10, sigma=0.1, label="p=10"),
+  list(n=31, p=20, sigma=0.1, label="p=20")
+)
+
+results2 <- bind_rows(lapply(configs2, function(cfg) {
+  cat(sprintf("  n=%d, p=%d, sigma=%.1f\n", cfg$n, cfg$p, cfg$sigma))
+  run_sim(cfg$n, cfg$p, cfg$sigma, label = cfg$label)
+}))
+
+# ============================================================
+# 绘图
+# ============================================================
+
+# 颜色方案
+col1 <- c("σ=0.1" = "#2196F3", "σ=0.2" = "#FF9800", "σ=0.3" = "#F44336")
+col2 <- c("p=3"   = "#4CAF50", "p=10"  = "#FF9800", "p=20"  = "#9C27B0")
+
+# ---- 图1a：log(样本PVE / 总体PVE) ~ sigma ----
+p1a <- ggplot(results1, aes(x = factor(k), y = med_log_ratio,
+                            color = label, group = label)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 3) +
+  scale_color_manual(values = col1) +
+  labs(
+    title    = "实验(1)：噪声水平对高估程度的影响",
+    subtitle = "n=31, p=3 | 虚线y=0表示无高估",
+    x        = "主成分索引 k",
+    y        = expression(log(widehat(PVE)[k] / PVE[k]) ~ "中位数"),
+    color    = "噪声水平"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        legend.position = "right")
+
+# ---- 图1b：样本PVE vs 总体PVE（实验1）----
+p1b <- results1 %>%
+  select(k, med_sample_pve, med_pop_pve, label) %>%
+  pivot_longer(c(med_sample_pve, med_pop_pve),
+               names_to = "type", values_to = "pve") %>%
+  mutate(type = recode(type,
+                       med_sample_pve = "样本PVE (2.3)",
+                       med_pop_pve    = "总体PVE (2.5)")) %>%
+  ggplot(aes(x = factor(k), y = pve,
+             color = label, linetype = type,
+             group = interaction(label, type))) +
+  geom_line(linewidth = 0.85) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = col1) +
+  scale_linetype_manual(values = c("样本PVE (2.3)" = "solid",
+                                   "总体PVE (2.5)" = "dashed")) +
+  labs(
+    title    = "实验(1)补充：样本PVE vs 总体PVE",
+    x        = "主成分索引 k",
+    y        = "PVE 中位数",
+    color    = "噪声水平",
+    linetype = "类型"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+# ---- 图2a：log(样本PVE / 总体PVE) ~ p（只看信号PC, k<=2）----
+p2a <- results2 %>%
+  filter(k <= 2) %>%
+  ggplot(aes(x = factor(k), y = med_log_ratio,
+             color = label, group = label)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 3) +
+  scale_color_manual(values = col2) +
+  labs(
+    title    = "实验(2)：维度p对高估程度的影响",
+    subtitle = "n=31, σ=0.1，rank=2 | 只展示信号主成分(k≤2)",
+    x        = "主成分索引 k",
+    y        = expression(log(widehat(PVE)[k] / PVE[k]) ~ "中位数"),
+    color    = "维度 p"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+# ---- 图2b：样本PVE vs 总体PVE（实验2，仅k<=2）----
+p2b <- results2 %>%
+  filter(k <= 2) %>%
+  select(k, med_sample_pve, med_pop_pve, label) %>%
+  pivot_longer(c(med_sample_pve, med_pop_pve),
+               names_to = "type", values_to = "pve") %>%
+  mutate(type = recode(type,
+                       med_sample_pve = "样本PVE (2.3)",
+                       med_pop_pve    = "总体PVE (2.5)")) %>%
+  ggplot(aes(x = factor(k), y = pve,
+             color = label, linetype = type,
+             group = interaction(label, type))) +
+  geom_line(linewidth = 0.85) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = col2) +
+  scale_linetype_manual(values = c("样本PVE (2.3)" = "solid",
+                                   "总体PVE (2.5)" = "dashed")) +
+  labs(
+    title    = "实验(2)补充：样本PVE vs 总体PVE",
+    x        = "主成分索引 k",
+    y        = "PVE 中位数",
+    color    = "维度 p",
+    linetype = "类型"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+# ---- 打印 ----
+print(p1a); print(p1b)
+print(p2a); print(p2b)
+
+# ============================================================
+# 数值摘要
+# ============================================================
+cat("\n========== 实验(1) 数值摘要 ==========\n")
+results1 %>%
+  mutate(across(where(is.numeric), ~round(.x, 4))) %>%
+  print()
+
+cat("\n========== 实验(2) 数值摘要（k<=2）==========\n")
+results2 %>%
+  filter(k <= 2) %>%
+  mutate(across(where(is.numeric), ~round(.x, 4))) %>%
+  print()
